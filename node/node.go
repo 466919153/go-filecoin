@@ -119,7 +119,7 @@ type Node struct {
 	// Incoming messages for block mining.
 	MsgPool *core.MessagePool
 	// Messages sent and not yet mined.
-	MsgQueue *core.MessageQueue
+	Outbox *core.Outbox
 
 	Wallet *wallet.Wallet
 
@@ -428,9 +428,10 @@ func (nc *Config) Build(ctx context.Context) (*Node, error) {
 	msgPool := core.NewMessagePool(chainStore, nc.Repo.Config().Mpool, consensus.NewIngestionValidator(chainFacade, nc.Repo.Config().Mpool))
 	msgQueue := core.NewMessageQueue()
 
+	outboxPolicy := core.NewMessageQueuePolicy(chainStore, core.OutboxMaxAgeRounds)
 	msgPublisher := newDefaultMessagePublisher(pubsub.NewPublisher(fsub), core.Topic, msgPool)
 	actorProvider := newDefaultActorProvider(chainStore, &cstOffline)
-	outbox := core.NewOutbox(fcWallet, consensus.NewOutboundMessageValidator(), msgQueue, msgPublisher, chainStore, actorProvider)
+	outbox := core.NewOutbox(fcWallet, consensus.NewOutboundMessageValidator(), msgQueue, msgPublisher, outboxPolicy, chainStore, actorProvider)
 
 	PorcelainAPI := porcelain.New(plumbing.New(&plumbing.APIDeps{
 		Bitswap:      bswap,
@@ -461,8 +462,8 @@ func (nc *Config) Build(ctx context.Context) (*Node, error) {
 		Exchange:     bswap,
 		host:         peerHost,
 		MsgPool:      msgPool,
-		MsgQueue:     msgQueue,
 		OfflineMode:  nc.OfflineMode,
+		Outbox:       outbox,
 		PeerHost:     peerHost,
 		Repo:         nc.Repo,
 		Wallet:       fcWallet,
@@ -548,15 +549,13 @@ func (node *Node) Start(ctx context.Context) error {
 	go node.handleSubscription(cctx, node.processBlock, "processBlock", node.BlockSub, "BlockSub")
 	go node.handleSubscription(cctx, node.processMessage, "processMessage", node.MessageSub, "MessageSub")
 
-	outboxPolicy := core.NewMessageQueuePolicy(node.MsgQueue, node.ChainReader, core.OutboxMaxAgeRounds)
-
 	node.HeaviestTipSetHandled = func() {}
 	node.HeaviestTipSetCh = node.ChainReader.HeadEvents().Sub(chain.NewHeadTopic)
 	head, err := node.PorcelainAPI.ChainHead()
 	if err != nil {
 		return errors.Wrap(err, "failed to get chain head")
 	}
-	go node.handleNewHeaviestTipSet(cctx, *head, outboxPolicy)
+	go node.handleNewHeaviestTipSet(cctx, *head)
 
 	if !node.OfflineMode {
 		node.Bootstrapper.Start(context.Background())
@@ -647,7 +646,7 @@ func (node *Node) handleNewMiningOutput(miningOutCh <-chan mining.Output) {
 
 }
 
-func (node *Node) handleNewHeaviestTipSet(ctx context.Context, head types.TipSet, outboxPolicy *core.MessageQueuePolicy) {
+func (node *Node) handleNewHeaviestTipSet(ctx context.Context, head types.TipSet) {
 	for {
 		select {
 		case ts, ok := <-node.HeaviestTipSetCh:
@@ -664,7 +663,7 @@ func (node *Node) handleNewHeaviestTipSet(ctx context.Context, head types.TipSet
 				continue
 			}
 
-			if err := outboxPolicy.OnNewHeadTipset(ctx, head, newHead); err != nil {
+			if err := node.Outbox.HandleNewHead(ctx, head, newHead); err != nil {
 				log.Error("updating outbound message queue for new tipset", err)
 			}
 			if err := node.MsgPool.UpdateMessagePool(ctx, node.ChainReader, head, newHead); err != nil {
